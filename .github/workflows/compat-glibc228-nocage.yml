@@ -1,0 +1,133 @@
+name: Compat build (glibc 2.28, x86_64, no caged heap)
+
+# Same EL8-compatible build as compat-glibc228.yml, but V8 is compiled from
+# source with the Oilpan caged heap disabled (cppgc_enable_caged_heap=false).
+#
+# Why: V8 13.x reserves ~32 GB of *virtual* address space at isolate startup
+# for the Oilpan caged heap (plus the 4 GB pointer cage). Hosts that cap the
+# per-process address space (ulimit -v / prlimit -v / CloudLinux LVE virtual
+# memory limit) crash at startup with:
+#   Fatal process out of memory: Oilpan: CagedHeap reservation.
+# There is no runtime flag to shrink that reservation; only a GN build arg
+# changes it. With the caged heap disabled the whole engine starts inside a
+# few hundred MB of address space.
+#
+# Slower than the stock compat build: V8 compiles from source (60-90 min on
+# a standard runner). Only use it when the stock build cannot start on the
+# target host.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      V8_FROM_SOURCE: "1"
+      EXTRA_GN_ARGS: cppgc_enable_caged_heap=false
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y git gcc gcc-c++ make cmake perl python3 curl unzip pkg-config clang llvm-devel
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build default (render) release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --features render
+
+      - name: Stage default release binary
+        run: |
+          mkdir -p dist/default
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/default/
+
+      - name: Build stealth release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --features render,stealth
+
+      - name: Stage stealth release binary
+        run: |
+          mkdir -p dist/stealth
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/stealth/
+
+      - name: Build no-render release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --no-default-features
+
+      - name: Stage no-render release binary
+        run: |
+          mkdir -p dist/no-render
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/no-render/
+
+      - name: Build no-render stealth release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --no-default-features --features stealth
+
+      - name: Stage no-render stealth release binary
+        run: |
+          mkdir -p dist/no-render-stealth
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/no-render-stealth/
+
+      - name: Verify EL8 ABI floor
+        run: |
+          for VARIANT in default stealth no-render no-render-stealth; do
+            echo "== dist/$VARIANT/obscura"
+            objdump -p "dist/$VARIANT/obscura" | grep NEEDED
+            objdump -T "dist/$VARIANT/obscura" | grep -oE '(GLIBC|GLIBCXX|GCC)_[^ ]*' | sort -Vu | tail -5
+          done
+          ALL_SYMS=$(for VARIANT in default stealth no-render no-render-stealth; do objdump -T "dist/$VARIANT/obscura"; done)
+          MAX_GLIBC=$(echo "$ALL_SYMS" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+          echo "max GLIBC: $MAX_GLIBC"
+          [ "$(printf '%s\n%s\n' "$MAX_GLIBC" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] || { echo "binary needs newer glibc than 2.28"; exit 1; }
+          MAX_GLIBCXX=$(echo "$ALL_SYMS" | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -1)
+          echo "max GLIBCXX: ${MAX_GLIBCXX:-none}"
+          if [ -n "$MAX_GLIBCXX" ]; then
+            [ "$(printf '%s\n%s\n' "$MAX_GLIBCXX" GLIBCXX_3.4.25 | sort -V | tail -1)" = GLIBCXX_3.4.25 ] || { echo "binary needs newer libstdc++ than GCC 8"; exit 1; }
+          fi
+
+      - name: Smoke test release binaries
+        run: |
+          for VARIANT in default stealth no-render no-render-stealth; do
+            dist/$VARIANT/obscura fetch "data:text/html,<title>ok</title>" --eval "1+1"
+          done
+          for VARIANT in default stealth; do
+            dist/$VARIANT/obscura fetch "data:text/html,<style>body{margin:0;background:%23123456}</style>" --screenshot smoke.png
+            test -s smoke.png
+            rm smoke.png
+          done
+          for VARIANT in no-render no-render-stealth; do
+            if dist/$VARIANT/obscura fetch "data:text/html,<title>no-render</title>" --screenshot smoke.png; then
+              echo "$VARIANT unexpectedly supports screenshots" >&2
+              exit 1
+            fi
+            test ! -e smoke.png
+          done
+
+      - name: Package
+        run: |
+          tar czf obscura-x86_64-glibc228-nocage.tar.gz -C dist/default obscura obscura-worker
+          tar czf obscura-x86_64-glibc228-nocage-stealth.tar.gz -C dist/stealth obscura obscura-worker
+          tar czf obscura-x86_64-glibc228-nocage-no-render.tar.gz -C dist/no-render obscura obscura-worker
+          tar czf obscura-x86_64-glibc228-nocage-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
+
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: obscura-glibc228-nocage-x86_64
+          path: obscura-x86_64-glibc228-nocage*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
