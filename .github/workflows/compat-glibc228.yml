@@ -35,7 +35,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustc" --version
 
-      - uses: Swatinem/rust-cache@3d16a9488cfa9415b7e91d1b00b8c6fdc19368bf2 # v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build default (render) release binary
         run: cargo build --profile release-dist -p obscura-cli --bins --features render
@@ -116,7 +116,7 @@ jobs:
           tar czf obscura-x86_64-glibc228-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
 
       - name: Upload packaged binaries
-        uses: actions/upload-artifact@330a01c490aca151604b66451a600b9d43576f8 # v4
+        uses: actions/upload-artifact@v4
         with:
           name: obscura-glibc228-x86_64
           path: obscura-x86_64-glibc228*.tar.gz
