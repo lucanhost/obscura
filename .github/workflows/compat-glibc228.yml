@@ -1,0 +1,124 @@
+name: Compat build (glibc 2.28, x86_64)
+
+# Compatibility build for hosts stuck on glibc 2.28 (EL8 and similar).
+# The official release is built on Ubuntu 22.04 (glibc 2.35) and cannot start
+# there. This builds the same four tarballs inside a manylinux_2_28 container
+# on a native x86_64 runner, so every binary only needs GLIBC <= 2.28.
+# Trigger manually from the Actions tab (workflow_dispatch only, no push triggers).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+
+    env:
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y git gcc gcc-c++ make cmake perl python3 curl pkg-config clang llvm-devel
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" --version
+
+      - uses: Swatinem/rust-cache@3d16a9488cfa9415b7e91d1b00b8c6fdc19368bf2 # v2
+
+      - name: Build default (render) release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --features render
+
+      - name: Stage default release binary
+        run: |
+          mkdir -p dist/default
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/default/
+
+      - name: Build stealth release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --features render,stealth
+
+      - name: Stage stealth release binary
+        run: |
+          mkdir -p dist/stealth
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/stealth/
+
+      - name: Build no-render release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --no-default-features
+
+      - name: Stage no-render release binary
+        run: |
+          mkdir -p dist/no-render
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/no-render/
+
+      - name: Build no-render stealth release binary
+        run: cargo build --profile release-dist -p obscura-cli --bins --no-default-features --features stealth
+
+      - name: Stage no-render stealth release binary
+        run: |
+          mkdir -p dist/no-render-stealth
+          cp target/release-dist/obscura target/release-dist/obscura-worker dist/no-render-stealth/
+
+      - name: Verify EL8 ABI floor
+        # The whole point of this build: every binary must run on glibc 2.28
+        # (EL8) and libstdc++ from GCC 8 (GLIBCXX 3.4.25). Fail loudly otherwise.
+        run: |
+          for VARIANT in default stealth no-render no-render-stealth; do
+            echo "== dist/$VARIANT/obscura"
+            echo "-- NEEDED:"
+            objdump -p "dist/$VARIANT/obscura" | grep NEEDED
+            echo "-- max symbol versions:"
+            objdump -T "dist/$VARIANT/obscura" | grep -oE '(GLIBC|GLIBCXX|GCC)_[^ ]*' | sort -Vu | tail -5
+          done
+          ALL_SYMS=$(for VARIANT in default stealth no-render no-render-stealth; do objdump -T "dist/$VARIANT/obscura"; done)
+          MAX_GLIBC=$(echo "$ALL_SYMS" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+          echo "max GLIBC: $MAX_GLIBC"
+          [ "$(printf '%s\n%s\n' "$MAX_GLIBC" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ] || { echo "binary needs newer glibc than 2.28"; exit 1; }
+          MAX_GLIBCXX=$(echo "$ALL_SYMS" | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -1)
+          echo "max GLIBCXX: ${MAX_GLIBCXX:-none}"
+          if [ -n "$MAX_GLIBCXX" ]; then
+            [ "$(printf '%s\n%s\n' "$MAX_GLIBCXX" GLIBCXX_3.4.25 | sort -V | tail -1)" = GLIBCXX_3.4.25 ] || { echo "binary needs newer libstdc++ than GCC 8"; exit 1; }
+          fi
+
+      - name: Smoke test release binaries
+        run: |
+          for VARIANT in default stealth no-render no-render-stealth; do
+            dist/$VARIANT/obscura fetch "data:text/html,<title>ok</title>" --eval "1+1"
+          done
+          for VARIANT in default stealth; do
+            dist/$VARIANT/obscura fetch "data:text/html,<style>body{margin:0;background:%23123456}</style>" --screenshot smoke.png
+            test -s smoke.png
+            rm smoke.png
+          done
+          for VARIANT in no-render no-render-stealth; do
+            if dist/$VARIANT/obscura fetch "data:text/html,<title>no-render</title>" --screenshot smoke.png; then
+              echo "$VARIANT unexpectedly supports screenshots" >&2
+              exit 1
+            fi
+            test ! -e smoke.png
+          done
+
+      - name: Package
+        run: |
+          tar czf obscura-x86_64-glibc228.tar.gz -C dist/default obscura obscura-worker
+          tar czf obscura-x86_64-glibc228-stealth.tar.gz -C dist/stealth obscura obscura-worker
+          tar czf obscura-x86_64-glibc228-no-render.tar.gz -C dist/no-render obscura obscura-worker
+          tar czf obscura-x86_64-glibc228-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
+
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@330a01c490aca151604b66451a600b9d43576f8 # v4
+        with:
+          name: obscura-glibc228-x86_64
+          path: obscura-x86_64-glibc228*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
